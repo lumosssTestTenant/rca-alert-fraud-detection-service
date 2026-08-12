@@ -444,6 +444,100 @@ app.post('/alerts/:id/resolve', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Chargeback intake — links issuer chargebacks back to the originating alert
+// ---------------------------------------------------------------------------
+
+/** @type {Map<string, object>} chargebackId -> chargeback */
+const chargebacks = new Map();
+
+metrics.chargebacks_received_total = 0;
+metrics.chargebacks_matched_total = 0;
+
+const CHARGEBACK_REASONS = new Set([
+  'fraudulent',
+  'product_not_received',
+  'duplicate',
+  'subscription_canceled',
+  'unrecognized',
+]);
+
+app.post('/chargebacks', (req, res, next) => {
+  try {
+    simulateFailure();
+
+    const { transactionId, reason, amount, issuerRef } = req.body || {};
+
+    if (!transactionId) {
+      return res.status(400).json({ error: 'transactionId is required', requestId: req.id });
+    }
+    if (!CHARGEBACK_REASONS.has(reason)) {
+      return res.status(400).json({
+        error: 'INVALID_REASON',
+        allowed: [...CHARGEBACK_REASONS],
+        requestId: req.id,
+      });
+    }
+
+    const tx = transactions.get(transactionId);
+    const linkedAlert = tx
+      ? [...alerts.values()].find((a) => a.transactionId === transactionId)
+      : null;
+
+    const chargeback = {
+      id: randomUUID(),
+      transactionId,
+      reason,
+      amount: typeof amount === 'number' ? amount : tx ? tx.amount : null,
+      issuerRef: issuerRef || null,
+      matchedTransaction: Boolean(tx),
+      alertId: linkedAlert ? linkedAlert.id : null,
+      receivedAt: new Date().toISOString(),
+    };
+
+    chargebacks.set(chargeback.id, chargeback);
+    metrics.chargebacks_received_total += 1;
+    if (tx) metrics.chargebacks_matched_total += 1;
+
+    // A fraudulent chargeback on an alert we already raised confirms the alert
+    // was a true positive; one with no alert is a miss worth flagging loudly.
+    if (reason === 'fraudulent') {
+      if (linkedAlert) {
+        linkedAlert.chargebackId = chargeback.id;
+        linkedAlert.outcome = 'true_positive';
+        linkedAlert.updatedAt = new Date().toISOString();
+      } else if (tx) {
+        log('error', 'fraudulent chargeback with no prior alert', {
+          requestId: req.id,
+          transactionId,
+          riskScore: tx.riskScore,
+        });
+      }
+    }
+
+    res.status(201).json({ chargeback, requestId: req.id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/chargebacks', (req, res) => {
+  const { reason, transactionId } = req.query;
+  let results = [...chargebacks.values()];
+  if (reason) results = results.filter((c) => c.reason === reason);
+  if (transactionId) results = results.filter((c) => c.transactionId === transactionId);
+  results.sort((a, b) => Date.parse(b.receivedAt) - Date.parse(a.receivedAt));
+  res.json({ count: results.length, chargebacks: results, requestId: req.id });
+});
+
+app.get('/chargebacks/:id', (req, res) => {
+  const chargeback = chargebacks.get(req.params.id);
+  if (!chargeback) {
+    return res.status(404).json({ error: 'CHARGEBACK_NOT_FOUND', requestId: req.id });
+  }
+  res.json(chargeback);
+});
+
+// ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
 
