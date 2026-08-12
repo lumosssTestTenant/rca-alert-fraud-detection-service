@@ -930,6 +930,120 @@ app.get('/transactions/batch/:batchId', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Analyst triage — assignment, SLA tracking and per-analyst work queues
+// ---------------------------------------------------------------------------
+
+const SLA_MINUTES_BY_SEVERITY = { critical: 15, high: 60, medium: 240, low: 1440 };
+
+metrics.alerts_assigned_total = 0;
+metrics.alerts_sla_breached_total = 0;
+
+function slaDeadline(alert) {
+  const minutes = SLA_MINUTES_BY_SEVERITY[alert.severity] ?? 1440;
+  return new Date(Date.parse(alert.createdAt) + minutes * 60_000).toISOString();
+}
+
+/** Decorates an alert with derived SLA state without mutating stored data. */
+function withSlaState(alert) {
+  const deadline = slaDeadline(alert);
+  const breached = alert.status !== 'resolved' && Date.parse(deadline) < Date.now();
+  return {
+    ...alert,
+    slaDeadline: deadline,
+    slaMinutes: SLA_MINUTES_BY_SEVERITY[alert.severity] ?? 1440,
+    slaBreached: breached,
+    minutesRemaining: Math.round((Date.parse(deadline) - Date.now()) / 60_000),
+  };
+}
+
+app.post('/alerts/:id/assign', (req, res) => {
+  const alert = alerts.get(req.params.id);
+  if (!alert) return res.status(404).json({ error: 'ALERT_NOT_FOUND', requestId: req.id });
+  if (alert.status === 'resolved') {
+    return res.status(409).json({ error: 'ALERT_ALREADY_RESOLVED', requestId: req.id });
+  }
+
+  const { analyst } = req.body || {};
+  if (!analyst || typeof analyst !== 'string') {
+    return res.status(400).json({ error: 'analyst is required', requestId: req.id });
+  }
+
+  alert.assignedTo = analyst;
+  alert.assignedAt = new Date().toISOString();
+  alert.updatedAt = alert.assignedAt;
+  if (alert.status === 'open') alert.status = 'triaging';
+  metrics.alerts_assigned_total += 1;
+
+  log('info', 'alert assigned', { requestId: req.id, alertId: alert.id, analyst });
+
+  res.json({ assigned: true, alert: withSlaState(alert), requestId: req.id });
+});
+
+app.post('/alerts/:id/unassign', (req, res) => {
+  const alert = alerts.get(req.params.id);
+  if (!alert) return res.status(404).json({ error: 'ALERT_NOT_FOUND', requestId: req.id });
+
+  const previous = alert.assignedTo || null;
+  delete alert.assignedTo;
+  delete alert.assignedAt;
+  if (alert.status === 'triaging') alert.status = 'open';
+  alert.updatedAt = new Date().toISOString();
+
+  res.json({ unassigned: true, previousAssignee: previous, requestId: req.id });
+});
+
+app.get('/alerts/queue/:analyst', (req, res) => {
+  const queue = [...alerts.values()]
+    .filter((a) => a.assignedTo === req.params.analyst && a.status !== 'resolved')
+    .map(withSlaState)
+    // Breached SLAs first, then the tightest deadline, then highest risk.
+    .sort(
+      (a, b) =>
+        Number(b.slaBreached) - Number(a.slaBreached) ||
+        a.minutesRemaining - b.minutesRemaining ||
+        b.riskScore - a.riskScore
+    );
+
+  res.json({
+    analyst: req.params.analyst,
+    count: queue.length,
+    breached: queue.filter((a) => a.slaBreached).length,
+    alerts: queue,
+    requestId: req.id,
+  });
+});
+
+// Namespaced under /triage: `/alerts/unassigned` would be shadowed by the
+// pre-existing `/alerts/:id` route registered earlier in the file.
+app.get('/triage/unassigned', (req, res) => {
+  const queue = [...alerts.values()]
+    .filter((a) => !a.assignedTo && a.status !== 'resolved')
+    .map(withSlaState)
+    .sort((a, b) => b.riskScore - a.riskScore);
+  res.json({ count: queue.length, alerts: queue, requestId: req.id });
+});
+
+app.get('/triage/sla', (req, res) => {
+  const active = [...alerts.values()].filter((a) => a.status !== 'resolved').map(withSlaState);
+  const breached = active.filter((a) => a.slaBreached);
+  metrics.alerts_sla_breached_total = breached.length;
+
+  const byAnalyst = {};
+  for (const alert of active) {
+    const key = alert.assignedTo || 'unassigned';
+    byAnalyst[key] = (byAnalyst[key] || 0) + 1;
+  }
+
+  res.json({
+    activeAlerts: active.length,
+    breachedAlerts: breached.length,
+    slaPolicyMinutes: SLA_MINUTES_BY_SEVERITY,
+    byAnalyst,
+    requestId: req.id,
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
 
