@@ -784,6 +784,152 @@ app.post('/transactions/screen', (req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// Bulk scoring — batch ingestion with per-item results and partial failures
+// ---------------------------------------------------------------------------
+
+const BULK_MAX_BATCH = parseInt(process.env.BULK_MAX_BATCH || '250', 10);
+
+metrics.bulk_batches_total = 0;
+metrics.bulk_items_rejected_total = 0;
+
+/** Validates one bulk item, returning an error string or null. */
+function validateBulkItem(item) {
+  if (!item || typeof item !== 'object') return 'item must be an object';
+  if (!item.accountId || typeof item.accountId !== 'string') return 'accountId is required';
+  if (typeof item.amount !== 'number' || Number.isNaN(item.amount) || item.amount <= 0) {
+    return 'amount must be a positive number';
+  }
+  return null;
+}
+
+app.post('/transactions/score/bulk', (req, res, next) => {
+  try {
+    const items = (req.body && req.body.transactions) || [];
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res
+        .status(400)
+        .json({ error: 'transactions must be a non-empty array', requestId: req.id });
+    }
+    if (items.length > BULK_MAX_BATCH) {
+      return res.status(413).json({
+        error: 'BATCH_TOO_LARGE',
+        max: BULK_MAX_BATCH,
+        received: items.length,
+        requestId: req.id,
+      });
+    }
+
+    const batchId = randomUUID();
+    const results = [];
+    let accepted = 0;
+    let rejected = 0;
+    let alertsRaised = 0;
+
+    items.forEach((item, index) => {
+      const validationError = validateBulkItem(item);
+      if (validationError) {
+        rejected += 1;
+        metrics.bulk_items_rejected_total += 1;
+        results.push({ index, status: 'rejected', error: validationError });
+        return;
+      }
+
+      try {
+        // Per-item failure injection keeps partial-failure paths exercised.
+        simulateFailure(FAILURE_RATE / 4);
+
+        const tx = {
+          id: randomUUID(),
+          accountId: item.accountId,
+          amount: item.amount,
+          currency: item.currency || 'USD',
+          originCountry: item.originCountry || null,
+          billingCountry: item.billingCountry || null,
+          deviceId: item.deviceId || null,
+          occurredAt: item.occurredAt || new Date().toISOString(),
+          scoredAt: new Date().toISOString(),
+          batchId,
+        };
+
+        const assessment = scoreTransaction(tx);
+        tx.riskScore = assessment.score;
+        tx.severity = assessment.severity;
+        transactions.set(tx.id, tx);
+        metrics.transactions_scored_total += 1;
+
+        let alertId = null;
+        if (assessment.severity !== 'low') {
+          const alert = {
+            id: randomUUID(),
+            transactionId: tx.id,
+            accountId: tx.accountId,
+            amount: tx.amount,
+            currency: tx.currency,
+            riskScore: assessment.score,
+            severity: assessment.severity,
+            status: 'open',
+            triggeredRules: assessment.triggeredRules,
+            escalated: false,
+            batchId,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+          alerts.set(alert.id, alert);
+          metrics.alerts_raised_total += 1;
+          alertsRaised += 1;
+          alertId = alert.id;
+        }
+
+        accepted += 1;
+        results.push({
+          index,
+          status: 'scored',
+          transactionId: tx.id,
+          riskScore: assessment.score,
+          severity: assessment.severity,
+          alertId,
+        });
+      } catch (err) {
+        rejected += 1;
+        results.push({ index, status: 'failed', error: err.code || 'INTERNAL_ERROR' });
+      }
+    });
+
+    metrics.bulk_batches_total += 1;
+    log('info', 'bulk batch processed', {
+      requestId: req.id,
+      batchId,
+      total: items.length,
+      accepted,
+      rejected,
+      alertsRaised,
+    });
+
+    // 207 signals a partial success so callers know to inspect per-item status.
+    res.status(rejected > 0 ? 207 : 201).json({
+      batchId,
+      total: items.length,
+      accepted,
+      rejected,
+      alertsRaised,
+      results,
+      requestId: req.id,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/transactions/batch/:batchId', (req, res) => {
+  const items = [...transactions.values()].filter((t) => t.batchId === req.params.batchId);
+  if (items.length === 0) {
+    return res.status(404).json({ error: 'BATCH_NOT_FOUND', requestId: req.id });
+  }
+  res.json({ batchId: req.params.batchId, count: items.length, transactions: items });
+});
+
+// ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
 
