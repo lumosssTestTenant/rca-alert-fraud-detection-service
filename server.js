@@ -538,6 +538,86 @@ app.get('/chargebacks/:id', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Account risk profiles — rolls transaction and alert history into one view
+// ---------------------------------------------------------------------------
+
+const RISK_BANDS = [
+  { max: 24, band: 'trusted' },
+  { max: 49, band: 'standard' },
+  { max: 74, band: 'elevated' },
+  { max: 100, band: 'restricted' },
+];
+
+function bandFor(score) {
+  return (RISK_BANDS.find((b) => score <= b.max) || RISK_BANDS[RISK_BANDS.length - 1]).band;
+}
+
+/**
+ * Builds a rolling risk profile for an account. The profile score blends the
+ * account's mean transaction risk with penalties for confirmed-fraud outcomes
+ * and escalations, so repeat offenders drift upward over time.
+ */
+function buildAccountProfile(accountId) {
+  const accountTxs = [...transactions.values()].filter((t) => t.accountId === accountId);
+  const accountAlerts = [...alerts.values()].filter((a) => a.accountId === accountId);
+
+  if (accountTxs.length === 0) return null;
+
+  const meanRisk =
+    accountTxs.reduce((sum, t) => sum + (t.riskScore || 0), 0) / accountTxs.length;
+  const totalValue = accountTxs.reduce((sum, t) => sum + t.amount, 0);
+  const escalated = accountAlerts.filter((a) => a.escalated).length;
+  const confirmedFraud = accountAlerts.filter(
+    (a) => a.resolution === 'confirmed_fraud' || a.outcome === 'true_positive'
+  ).length;
+
+  const penalty = Math.min(40, escalated * 5 + confirmedFraud * 15);
+  const profileScore = Math.min(100, Math.round(meanRisk + penalty));
+
+  return {
+    accountId,
+    profileScore,
+    riskBand: bandFor(profileScore),
+    transactionCount: accountTxs.length,
+    alertCount: accountAlerts.length,
+    escalatedAlerts: escalated,
+    confirmedFraudAlerts: confirmedFraud,
+    meanRiskScore: Math.round(meanRisk * 10) / 10,
+    totalTransactedValue: Math.round(totalValue * 100) / 100,
+    firstSeen: accountTxs.reduce((a, t) => (t.scoredAt < a ? t.scoredAt : a), accountTxs[0].scoredAt),
+    lastSeen: accountTxs.reduce((a, t) => (t.scoredAt > a ? t.scoredAt : a), accountTxs[0].scoredAt),
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+app.get('/accounts/:accountId/risk', (req, res) => {
+  const profile = buildAccountProfile(req.params.accountId);
+  if (!profile) {
+    return res.status(404).json({ error: 'ACCOUNT_NOT_FOUND', requestId: req.id });
+  }
+  res.json({ ...profile, requestId: req.id });
+});
+
+app.get('/accounts/:accountId/transactions', (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || '50', 10), 200);
+  const results = [...transactions.values()]
+    .filter((t) => t.accountId === req.params.accountId)
+    .sort((a, b) => Date.parse(b.scoredAt) - Date.parse(a.scoredAt))
+    .slice(0, limit);
+  res.json({ count: results.length, transactions: results, requestId: req.id });
+});
+
+app.get('/accounts/high-risk', (req, res) => {
+  const threshold = parseInt(req.query.threshold || '60', 10);
+  const accountIds = [...new Set([...transactions.values()].map((t) => t.accountId))];
+  const profiles = accountIds
+    .map(buildAccountProfile)
+    .filter((p) => p && p.profileScore >= threshold)
+    .sort((a, b) => b.profileScore - a.profileScore);
+  res.json({ threshold, count: profiles.length, accounts: profiles, requestId: req.id });
+});
+
+// ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
 
