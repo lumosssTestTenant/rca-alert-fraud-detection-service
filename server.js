@@ -618,6 +618,172 @@ app.get('/accounts/high-risk', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Trusted-party allowlist — suppress alerts for verified accounts and devices
+// ---------------------------------------------------------------------------
+
+/** @type {Map<string, object>} "account:<id>" | "device:<id>" -> entry */
+const allowlist = new Map();
+
+metrics.allowlist_suppressions_total = 0;
+
+const ALLOWLIST_TYPES = new Set(['account', 'device']);
+
+function allowlistKey(type, value) {
+  return `${type}:${value}`;
+}
+
+/** Returns the matching allowlist entry for a transaction, or null. */
+function findAllowlistMatch(tx) {
+  const candidates = [
+    allowlistKey('account', tx.accountId),
+    tx.deviceId ? allowlistKey('device', tx.deviceId) : null,
+  ].filter(Boolean);
+
+  for (const key of candidates) {
+    const entry = allowlist.get(key);
+    if (!entry) continue;
+    if (entry.expiresAt && Date.parse(entry.expiresAt) < Date.now()) {
+      allowlist.delete(key);
+      continue;
+    }
+    return entry;
+  }
+  return null;
+}
+
+app.post('/allowlist', (req, res) => {
+  const { type, value, reason, expiresAt } = req.body || {};
+
+  if (!ALLOWLIST_TYPES.has(type)) {
+    return res
+      .status(400)
+      .json({ error: 'INVALID_TYPE', allowed: [...ALLOWLIST_TYPES], requestId: req.id });
+  }
+  if (!value || typeof value !== 'string') {
+    return res.status(400).json({ error: 'value is required', requestId: req.id });
+  }
+
+  const entry = {
+    key: allowlistKey(type, value),
+    type,
+    value,
+    reason: reason || 'manually_verified',
+    expiresAt: expiresAt || null,
+    addedAt: new Date().toISOString(),
+  };
+
+  allowlist.set(entry.key, entry);
+  log('info', 'allowlist entry added', { requestId: req.id, key: entry.key, reason: entry.reason });
+
+  res.status(201).json({ entry, requestId: req.id });
+});
+
+app.get('/allowlist', (req, res) => {
+  const now = Date.now();
+  const entries = [...allowlist.values()].filter(
+    (e) => !e.expiresAt || Date.parse(e.expiresAt) >= now
+  );
+  res.json({ count: entries.length, entries, requestId: req.id });
+});
+
+app.delete('/allowlist/:type/:value', (req, res) => {
+  const key = allowlistKey(req.params.type, req.params.value);
+  if (!allowlist.delete(key)) {
+    return res.status(404).json({ error: 'ALLOWLIST_ENTRY_NOT_FOUND', requestId: req.id });
+  }
+  log('info', 'allowlist entry removed', { requestId: req.id, key });
+  res.json({ removed: true, key, requestId: req.id });
+});
+
+/**
+ * Allowlist-aware scoring. Still computes and stores the full risk assessment
+ * so analytics stay intact, but suppresses alert creation for trusted parties.
+ */
+app.post('/transactions/screen', (req, res, next) => {
+  try {
+    simulateFailure();
+
+    const { accountId, amount } = req.body || {};
+    if (!accountId || typeof amount !== 'number' || amount <= 0) {
+      return res
+        .status(400)
+        .json({ error: 'accountId and a positive amount are required', requestId: req.id });
+    }
+
+    const tx = {
+      id: randomUUID(),
+      accountId,
+      amount,
+      currency: req.body.currency || 'USD',
+      originCountry: req.body.originCountry || null,
+      billingCountry: req.body.billingCountry || null,
+      deviceId: req.body.deviceId || null,
+      occurredAt: req.body.occurredAt || new Date().toISOString(),
+      scoredAt: new Date().toISOString(),
+    };
+
+    const assessment = scoreTransaction(tx);
+    tx.riskScore = assessment.score;
+    tx.severity = assessment.severity;
+    transactions.set(tx.id, tx);
+    metrics.transactions_scored_total += 1;
+
+    const match = findAllowlistMatch(tx);
+    if (match) {
+      metrics.allowlist_suppressions_total += 1;
+      tx.suppressedBy = match.key;
+      log('info', 'alert suppressed by allowlist', {
+        requestId: req.id,
+        transactionId: tx.id,
+        key: match.key,
+        riskScore: assessment.score,
+      });
+      return res.status(201).json({
+        transactionId: tx.id,
+        riskScore: assessment.score,
+        severity: assessment.severity,
+        suppressed: true,
+        suppressedBy: match,
+        alertId: null,
+        requestId: req.id,
+      });
+    }
+
+    let alertId = null;
+    if (assessment.severity !== 'low') {
+      const alert = {
+        id: randomUUID(),
+        transactionId: tx.id,
+        accountId: tx.accountId,
+        amount: tx.amount,
+        currency: tx.currency,
+        riskScore: assessment.score,
+        severity: assessment.severity,
+        status: 'open',
+        triggeredRules: assessment.triggeredRules,
+        escalated: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+      alerts.set(alert.id, alert);
+      metrics.alerts_raised_total += 1;
+      alertId = alert.id;
+    }
+
+    res.status(201).json({
+      transactionId: tx.id,
+      riskScore: assessment.score,
+      severity: assessment.severity,
+      suppressed: false,
+      alertId,
+      requestId: req.id,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
 
