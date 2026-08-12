@@ -1044,6 +1044,131 @@ app.get('/triage/sla', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Runtime rule tuning — adjust weights and toggle rules without a redeploy
+// ---------------------------------------------------------------------------
+
+/** @type {Array<object>} append-only audit trail of tuning changes */
+const ruleAuditLog = [];
+
+metrics.rule_config_changes_total = 0;
+
+const MAX_RULE_WEIGHT = 100;
+
+function findRule(ruleId) {
+  return RULES.find((r) => r.id === ruleId);
+}
+
+function auditRuleChange(entry) {
+  ruleAuditLog.push({ id: randomUUID(), at: new Date().toISOString(), ...entry });
+  metrics.rule_config_changes_total += 1;
+  if (ruleAuditLog.length > 500) ruleAuditLog.shift();
+}
+
+app.get('/rules/:ruleId', (req, res) => {
+  const rule = findRule(req.params.ruleId);
+  if (!rule) return res.status(404).json({ error: 'RULE_NOT_FOUND', requestId: req.id });
+
+  const firings = [...alerts.values()].reduce(
+    (count, alert) =>
+      count + (alert.triggeredRules || []).filter((t) => t.ruleId === rule.id).length,
+    0
+  );
+
+  res.json({
+    id: rule.id,
+    description: rule.description,
+    weight: rule.weight,
+    enabled: rule.enabled !== false,
+    firingsInCurrentAlerts: firings,
+    requestId: req.id,
+  });
+});
+
+app.patch('/rules/:ruleId', (req, res) => {
+  const rule = findRule(req.params.ruleId);
+  if (!rule) return res.status(404).json({ error: 'RULE_NOT_FOUND', requestId: req.id });
+
+  const { weight, enabled } = req.body || {};
+  if (weight === undefined && enabled === undefined) {
+    return res
+      .status(400)
+      .json({ error: 'at least one of weight or enabled is required', requestId: req.id });
+  }
+
+  const before = { weight: rule.weight, enabled: rule.enabled !== false };
+
+  if (weight !== undefined) {
+    if (typeof weight !== 'number' || weight < 0 || weight > MAX_RULE_WEIGHT) {
+      return res.status(400).json({
+        error: 'INVALID_WEIGHT',
+        message: `weight must be between 0 and ${MAX_RULE_WEIGHT}`,
+        requestId: req.id,
+      });
+    }
+    rule.weight = weight;
+  }
+
+  if (enabled !== undefined) {
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'enabled must be a boolean', requestId: req.id });
+    }
+    rule.enabled = enabled;
+    // A disabled rule contributes nothing; the engine skips zero-weight reasons.
+    const original = rule.evaluate;
+    if (!rule.originalEvaluate) rule.originalEvaluate = original;
+    rule.evaluate = enabled ? rule.originalEvaluate : () => null;
+  }
+
+  const after = { weight: rule.weight, enabled: rule.enabled !== false };
+  auditRuleChange({ ruleId: rule.id, before, after, actor: req.body.actor || 'api' });
+
+  log('warn', 'rule configuration changed', {
+    requestId: req.id,
+    ruleId: rule.id,
+    before,
+    after,
+  });
+
+  res.json({ updated: true, rule: { id: rule.id, ...after }, requestId: req.id });
+});
+
+app.get('/rules/:ruleId/audit', (req, res) => {
+  const entries = ruleAuditLog.filter((e) => e.ruleId === req.params.ruleId);
+  res.json({ ruleId: req.params.ruleId, count: entries.length, entries, requestId: req.id });
+});
+
+app.post('/rules/simulate', (req, res, next) => {
+  try {
+    const { transaction, overrides } = req.body || {};
+    if (!transaction || !transaction.accountId || typeof transaction.amount !== 'number') {
+      return res
+        .status(400)
+        .json({ error: 'transaction with accountId and amount is required', requestId: req.id });
+    }
+
+    // Apply weight overrides, score, then always restore — never leaks state.
+    const saved = RULES.map((r) => r.weight);
+    try {
+      for (const [ruleId, weight] of Object.entries(overrides || {})) {
+        const rule = findRule(ruleId);
+        if (rule && typeof weight === 'number') rule.weight = weight;
+      }
+      const assessment = scoreTransaction({
+        ...transaction,
+        occurredAt: transaction.occurredAt || new Date().toISOString(),
+      });
+      res.json({ dryRun: true, ...assessment, overridesApplied: overrides || {}, requestId: req.id });
+    } finally {
+      RULES.forEach((r, i) => {
+        r.weight = saved[i];
+      });
+    }
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Error handling
 // ---------------------------------------------------------------------------
 
