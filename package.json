@@ -1,0 +1,16 @@
+{
+  "name": "aiops-rca-demo-rca-alert-fraud-detection-service",
+  "version": "1.0.0",
+  "description": "Fraud detection and alerting service that scores payment transactions in real time, raises fraud alerts with severity classification, and routes them to downstream AIOps incident channels",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "echo 'Build OK'",
+    "test": "echo 'No tests — dummy build OK' && exit 0"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "uuid": "^9.0.0"
+  },
+  "engines": { "node": ">=18" }
+}

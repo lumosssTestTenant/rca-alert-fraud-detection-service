@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+*.jar
+target/
+.idea/
+TEST*.xml
+.DS_Store
+Thumbs.db
+.env
+coverage/

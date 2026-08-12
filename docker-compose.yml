@@ -1,0 +1,32 @@
+services:
+  rca-alert-fraud-detection-service:
+    build: { context: ., dockerfile: Dockerfile }
+    image: aiops-rca-demo/rca-alert-fraud-detection-service:local
+    container_name: rca-alert-fraud-detection-service
+    restart: unless-stopped
+    ports: ["${HOST_PORT:-3000}:3000"]
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 3000
+      SERVICE_NAME: ${SERVICE_NAME:-rca-alert-fraud-detection-service}
+      SERVICE_VERSION: ${SERVICE_VERSION:-1.0.0}
+      API_KEY: ${API_KEY:-}
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-60000}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-100}
+      FAILURE_RATE: ${FAILURE_RATE:-0.05}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  nginx:
+    profiles: [proxy]
+    image: nginx:1.25-alpine
+    container_name: rca-alert-fraud-detection-service-proxy
+    restart: unless-stopped
+    depends_on:
+      rca-alert-fraud-detection-service: { condition: service_healthy }
+    ports: ["${PROXY_PORT:-8080}:80"]
+    volumes: ["./nginx.conf:/etc/nginx/conf.d/default.conf:ro"]

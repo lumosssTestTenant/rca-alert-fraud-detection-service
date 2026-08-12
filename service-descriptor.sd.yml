@@ -1,0 +1,19 @@
+organization: AIOps
+description: Fraud detection and alerting service that scores payment transactions in real time, raises fraud alerts with severity classification, and routes them to downstream AIOps incident channels
+computeClassification:
+  dataType: [None]
+links:
+  healthcheck:
+    uri: /health
+  source:
+    url: https://github.com/lumosssTestTenant/rca-alert-fraud-detection-service
+compose:
+  microservice:
+    image: ghcr.io/lumosssTestTenant/rca-alert-fraud-detection-service
+    tag: ${DOCKER_TAG}
+    ports: [8080:3000]
+buildNumber: ${DOCKER_TAG}
+config:
+  environmentVariables:
+    NODE_ENV: production
+    SERVICE_NAME: rca-alert-fraud-detection-service

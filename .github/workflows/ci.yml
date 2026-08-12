@@ -1,0 +1,37 @@
+name: CI/CD — rca-alert-fraud-detection-service
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - run: echo "DOCKER_TAG=${GITHUB_SHA::12}" >> $GITHUB_ENV
+      - run: |
+          echo "Building rca-alert-fraud-detection-service commit=${{ env.DOCKER_TAG }}"
+          sleep 5
+
+  deploy:
+    name: Deploy to prod-east
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: prod-east
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "DOCKER_TAG=${GITHUB_SHA::12}" >> $GITHUB_ENV
+      - run: |
+          echo "Deploying rca-alert-fraud-detection-service to prod-east commit=${{ env.DOCKER_TAG }}"
+          sleep 3
